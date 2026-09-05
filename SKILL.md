@@ -1,7 +1,7 @@
 ---
 name: remodel-model
 description: "Natural-language remodelling for downloaded 3D-print models (STL/3MF/OBJ): resize with hole-preservation, drill, fill, thicken, hollow, round edges, cut, extend, mirror, relocate. Backed by manifold3d CSG — every write op passes a five-gate validation pipeline (watertight / self-intersection / min-wall / overhang / dimension-chain). Activate when user says: 改模, 改尺寸, 孔做大点, 填孔, 掏空, 倒角, 'make it 5mm longer', 'enlarge the hole to M4', 'the downloaded part doesn't fit', or any edit of an existing mesh."
-version: "0.5.0"
+version: "0.6.0"
 license: MIT
 keywords:
   - 3d model edit
@@ -80,8 +80,27 @@ agent 负责意图理解和结果把关。五道门防的是**语义错误**（�
    「完全不可用」）；③余量策略（FDM「刚好」= 每边 +0.3mm 插入余量，100×100
    方物 → 内腔 100.6×100.6，精确 100.0 是放不进去的）；④硬约束清单（如 SKÅDIS
    挂装接口 40mm 网格必须保持）。用户说「重新描述需求」= 旧交付物作废、新口径
-   全权，别为旧方案辩护。**改模承诺 = 在真实下载件上做修改**，从零参数化重建
-   只是兜底，别当主路。
+   全权，别为旧方案辩护。
+
+**改模铁律（2026-09-05 用户定版，两条都踩过坑）**：
+
+① **改模 ≠ 建模**。「改模承诺 = 在真实下载件上做修改」。从零参数化重建只是
+   兑底中的兑底——重建件的结构语言（挂钩形态/镂空位置/公差风格）不等于原作，
+   用户一眼识破（「这不是在那个模型基础上改的」）且大概率不可用。
+
+② **下载不到原件 → 直接向用户要文件，并且一开始就说清楚**。下载路径全部
+   试尽（MW 登录墙 / CDN 401 / CF 挑战 / GitHub 镜像）仍拿不到时，**立刻
+   明说「我拿不到原件，需要你下载后发我」，同时停下等待**——不要转入
+   从零重建然后装作完成了需求。用户原话：「如果你做不到我的需求，你可以直接
+   告诉我，而不是白白做无用的尝试浪费 token」。半途告知也比沉默重建强：
+   分析原作设计语言期间就应说「无法下载原件，方案 A 等你给文件 / 方案 B
+   按图片分析重建（有偏差风险）」让用户选。
+
+③ **拿到原件后：先解剖再动刀**。切片剖面族（ASCII 可视化）+ contains 射线
+   实测内腔/壁位/挂槽坐标，画出结构图后再定修改方案；动刀优先 boolean 手术
+   （劈半平移/挖腔/填补）而非重造。每个手术步骤后跑一扇验证门（位置/尺寸/
+   水密/单件），全绿才交付。
+
 1. **单位永远是 mm**，M 系螺丝孔径 = 螺纹公称 + 0.2（M3→3.2，M4→4.2，M5→5.2）
 2. **「改尺寸」默认问清**：整体缩放还是只改一维？改完的孔要不要保原径？
    —— 默认 `--keep-holes`，因为 99% 的场景是「下载件差一点」，孔是要配螺丝的
@@ -221,6 +240,20 @@ agent 负责意图理解和结果把关。五道门防的是**语义错误**（�
 - **3MF 解析要点**（2026-09-04）：顶点/三角直接正则提取 `<vertex x=...>` /
   `<triangle v1=...>` 即可，无需完整 XML 解析；`<item>` 可能带 transform（12 数
   4×3 矩阵），无 transform 时 raw 坐标即世界坐标——bbox 与模型名对不上先查 transform
+- **batch_boolean 顺序敏感（2026-09-05 实测，v2.x）**：`batch_boolean([大盒, M], Intersect)`
+  在大盒远超 M bbox 时可能返回荒唐小值（2.2 vs 正确 18.0），交换参数顺序或缩小
+  盒到实际邻域后恢复。用 `m3d.OpType` 枚举（Add/Intersect/Subtract），别传裸数字
+  （v2.x 裸 int 会 TypeError）；Manifold 构造：`m3d.Mesh(vert_properties=..., tri_verts=...)`
+  后 `m3d.Manifold(vm)`，直接传 trimesh 对象会 TypeError
+- **ASCII 剖面族是解剖下载件的利器**（2026-09-05 充电宝挂件全链验证）：对陌生 3MF
+  逐层 `mesh.contains` 网格扫描打印字符图，内腔/壁厚/挂槽位置一目了然，比渲染猜
+  可靠——渲染会被深度排序伪影骗（大三角形穿模出假碎片），ASCII 剖面不会
+- **渲染伪影 ≠ 几何缺陷**（2026-09-05）：matplotlib Poly3DCollection 深度排序对
+  大三角形会画出错位碎片/穿模假象，vision 复检会误报「碎面/悬空」。客观判据：
+  ①腔体空区三角计数 = 0；②体积对账（分件体积和 vs 总体积，误差<0.1%）；
+  ③watertight + 单连通。三者全绿就是渲染锅，细分三角形（subdivide）重渲染即可
+- **vision_analyze 超时应急预案**：连续 2 次超时就放弃图像路线，切 ASCII 剖面 +
+  顶点统计的纯几何验证（本次充电宝挂件最终就是靠这个交付的）
 - **底模资格门——下载件名字会骗人，改造前先解剖（2026-09-04 实测）**：本地旧件
   `bin_115x30x260.stl` 名字带 bin，实测却是 466mm² 恒截面薄壁竖板（无内腔可改）；
   面法向提取挂槽壁（|nx|>0.85）实测槽宽 6.5mm ✓ 但槽心间距 57.5mm ✗——不是
@@ -229,12 +262,16 @@ agent 负责意图理解和结果把关。五道门防的是**语义错误**（�
   恒定小截面 = 实心板；② 挂装接口实测——面法向提取槽/孔壁坐标，间距对 40mm
   网格（槽宽 6mm+ 是挂件常见钥匙孔接口，与 5mm 圆孔同属标准接口，保孔规则同）；
   ③ 内腔投影 ≥ 目标件 + 余量——不到就是选错底模，换件别硬改
-- **底模下载源现实矩阵（2026-09-04 全通道实测）**：MakerWorld 文件下载要登录
-  （design-service API 只给元数据，选件比尺寸不用登录）；Thingiverse CF 是**按天
-  概率**——09-03 全通、09-04 全浏览器头×3 / API / CDN 子域全 403，无头浏览器
-  过不了 checkbox 挑战（iframe 不渲染），隔天重试是正经策略；**GitHub 镜像仓库
-  是最稳下载源**：`gh api "search/repositories?q=skadis"` 找镜像 → Contents API
-  base64 取件（raw 直连超时时验证过的绕行，见 github skill api-push.md §4c）。
+- **底模下载源现实矩阵（2026-09-04 全通道实测，2026-09-05 补充 MW 3MF 通道）**：
+  MakerWorld 文件下载要登录（design-service API 只给元数据，选件比尺寸不用登录）；
+  3MF CDN 直链 401（`/model/{hash}/{profileId}/...` 无 token 全 401，别浪费调用）；
+  design-service `/instances` 能拿到 instanceId 和封面，但文件端点全 404；
+  无头浏览器过不了 CF checkbox 挑战（「Just a moment」卡死）；
+  **最快路径 = 直接请用户下载后发文件**（一次澄清，十分钟内解决）。
+  Thingiverse CF 是**按天概率**——09-03 全通、09-04 全浏览器头×3 / API / CDN 子域全 403，
+  无头浏览器过不了 checkbox 挑战（iframe 不渲染），隔天重试是正经策略；
+  **GitHub 镜像仓库是最稳机器下载源**：`gh api "search/repositories?q=skadis"` 找镜像
+  → Contents API base64 取件（raw 直连超时时验证过的绕行，见 github skill api-push.md §4c）。
   已知可用：masibu-labs/Skadis_Storage（GPL-3.0，Square/Round 容器 3MF + Hooks
   + ToolHolders）。详见 references/base-model-download-sources.md
 
