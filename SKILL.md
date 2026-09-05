@@ -240,6 +240,9 @@ agent 负责意图理解和结果把关。五道门防的是**语义错误**（�
 - **3MF 解析要点**（2026-09-04）：顶点/三角直接正则提取 `<vertex x=...>` /
   `<triangle v1=...>` 即可，无需完整 XML 解析；`<item>` 可能带 transform（12 数
   4×3 矩阵），无 transform 时 raw 坐标即世界坐标——bbox 与模型名对不上先查 transform
+- **manifold3d v2 `cube()` 非居中（2026-09-05 实测）**：`m3d.Manifold.cube([sx,sy,sz])`
+  生成 `[0..size]` 而非居中在原点！平移时传角点不传中心，否则全部几何整体偏移一半
+  （batch_boolean 能跑通但结果全错）。自测法：cube 后查 bbox 是否 `[0..s]`
 - **batch_boolean 顺序敏感（2026-09-05 实测，v2.x）**：`batch_boolean([大盒, M], Intersect)`
   在大盒远超 M bbox 时可能返回荒唐小值（2.2 vs 正确 18.0），交换参数顺序或缩小
   盒到实际邻域后恢复。用 `m3d.OpType` 枚举（Add/Intersect/Subtract），别传裸数字
