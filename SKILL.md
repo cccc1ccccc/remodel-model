@@ -240,6 +240,13 @@ agent 负责意图理解和结果把关。五道门防的是**语义错误**（�
 - **3MF 解析要点**（2026-09-04）：顶点/三角直接正则提取 `<vertex x=...>` /
   `<triangle v1=...>` 即可，无需完整 XML 解析；`<item>` 可能带 transform（12 数
   4×3 矩阵），无 transform 时 raw 坐标即世界坐标——bbox 与模型名对不上先查 transform
+- **导出后必须回读验证（2026-09-05 用户报「组件满天飞」教训）**：STL/3MF 写盘后
+  重新 load 并检查 `len(mesh.split(only_watertight=False))==1` —— kernel 内变量
+  正确 ≠ 磁盘文件正确（中间重跑/旧文件覆盖都会导致交付旧版多壳件，BS 打开
+  就是满盘飞组件）。交付门：单 body + watertight + 体积对账，缺一不交付
+- **trimesh 3MF 导出缺 build item**：导出的 3dmodel.model 没有
+  `<build><item objectid="1"/></build>`，BS 打开不显示；解包手补 XML 再打包，
+  顺便把 object name 里的 .stl 后缀改掉
 - **manifold3d v2 `cube()` 非居中（2026-09-05 实测）**：`m3d.Manifold.cube([sx,sy,sz])`
   生成 `[0..size]` 而非居中在原点！平移时传角点不传中心，否则全部几何整体偏移一半
   （batch_boolean 能跑通但结果全错）。自测法：cube 后查 bbox 是否 `[0..s]`
