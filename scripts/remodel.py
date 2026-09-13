@@ -14,7 +14,10 @@ Typical:
   python3 remodel.py resize part.stl --size 40x20x5 --keep-holes -o out.stl
   python3 remodel.py resize part.stl --factor 1.2 --keep-holes -o out.stl
   python3 remodel.py drill part.stl --at 30,20,0 --dia 3.2 --through -o out.stl
-  python3 remodel.py drill part.stl --at 30,20,0 --dia 5 --depth 6 -o out.stl
+    # --through: --at only needs x,y inside the part; the axial coordinate is ignored
+  python3 remodel.py drill part.stl --at 30,20,4 --dia 5 --depth 2 -o out.stl
+    # blind hole: --at is the hole MOUTH on the surface; the hole extends
+    # INTO the material along -Z by --depth (z=4 mouth, depth 2 -> z=2..4)
   python3 remodel.py fill part.stl --dia 4 -o out.stl
   python3 remodel.py thicken part.stl --by 1.0 -o out.stl
   python3 remodel.py hollow part.stl --wall 2 -o out.stl
@@ -83,22 +86,78 @@ def load_manifold(path):
         man = m if man is None else m3d.Manifold.compose([man, m])
     return man
 
+def _patch_3mf(path):
+    """trimesh's 3MF export omits <build><item/>, so Bambu Studio / Blender open
+    an empty scene (bitten 2026-09-04, documented in SKILL.md). Post-process the
+    zip: add the build item, and strip a stray .stl suffix from the object name."""
+    import re as _re
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        data = {n: z.read(n) for n in z.namelist()}
+    xml = data.get("3D/3dmodel.model")
+    if xml is None:
+        return False
+    xml = xml.decode("utf-8", "ignore")
+    changed = False
+    if "<build" not in xml:
+        xml = xml.replace("</model>", '<build><item objectid="1"/></build></model>')
+        changed = True
+    xml2 = _re.sub(r'(<object[^>]*\bname=")([^"]*)\.stl(")', r"\1\2\3", xml)
+    if xml2 != xml:
+        xml, changed = xml2, True
+    data["3D/3dmodel.model"] = xml.encode("utf-8")
+    import os
+    tmp = path + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
+        for n, b in data.items():
+            z.writestr(n, b)
+    os.replace(tmp, path)
+    return changed
+
+
 def export(man, path):
     tm = man_to_tri(man)
     if path.lower().endswith(".3mf"):
         scene = trimesh.Scene()
         scene.add_geometry(tm)
         scene.export(path)
+        _patch_3mf(path)
     else:
         tm.export(path)
     return path
+
+
+def verify_export(man, path, expected_bodies):
+    """Post-export re-read verification (delivery gate, per SKILL.md 2026-09-05:
+    kernel state != disk state — stale overwrites / mid-run rewrites have shipped
+    multi-shell files). Compares body count, watertightness and volume against
+    the in-memory manifold. Re-read goes through load_manifold -> man_to_tri
+    (manifold3d reconstruction), NOT raw trimesh.load — the raw STL re-read
+    reports false non-watertightness on merged-vertex soup (SKILL.md)."""
+    r = {"path": path, "ok": False}
+    try:
+        back = load_manifold(path)
+    except Exception as e:
+        r["error"] = f"re-read failed: {type(e).__name__}: {e}"
+        return False, r
+    bodies = len(back.decompose())
+    tm = man_to_tri(back)
+    vol_in = float(man.volume())
+    vol_out = float(back.volume())
+    r["bodies"] = int(bodies)
+    r["expected_bodies"] = int(expected_bodies)
+    r["watertight"] = bool(tm.is_watertight and tm.is_winding_consistent)
+    r["volume_delta_pct"] = round(100.0 * abs(vol_out - vol_in) / max(abs(vol_in), 1e-9), 3)
+    ok = (bodies == expected_bodies and r["watertight"] and r["volume_delta_pct"] < 0.5)
+    r["ok"] = bool(ok)
+    return bool(ok), r
 
 def _align_z_to_axis(man, axis):
     axis = np.asarray(axis, dtype=np.float64)
     if np.allclose(axis, [0, 0, 1]):
         return man
     if np.allclose(axis, [0, 0, -1]):
-        return man.mirror([0, 1, 0])
+        return man.mirror([0, 0, 1])  # flip along Z (was [0,1,0]: a no-op for a cylinder)
     from scipy.spatial.transform import Rotation
     from trimesh.geometry import align_vectors
     R = align_vectors([0, 0, 1], axis)[:3, :3]
@@ -110,6 +169,38 @@ def _bb(man):
     """bounding_box() -> (min corner, max corner) as float64 arrays."""
     b = np.asarray(man.bounding_box(), dtype=np.float64)
     return b[:3].copy(), b[3:].copy()
+
+
+def _proj_extent(lo, hi, axis):
+    """[min, max] of the bbox corners projected onto `axis`."""
+    axis = np.asarray(axis, dtype=np.float64)
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0])
+                        for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+    t = corners @ axis
+    return float(t.min()), float(t.max())
+
+
+def _cyl_spanned(man, axis, center, radius, a0, a1, segments=64):
+    """Cylinder aligned to `axis`, laterally on the hole line through `center`,
+    covering the axial range [a0, a1] EXACTLY.
+
+    Positioning is bbox-measured, never assumed: manifold3d cylinders span
+    0..height along +Z (NOT centered — v2 and v3 alike) and rotations move
+    the bbox, so any translate(center)-style placement silently halves a
+    through-cut (bitten 2026-09-13: resize --keep-holes re-drill produced
+    half-depth holes, genus 0, while every gate stayed green). We align
+    first, measure the cylinder's own bbox, then translate by
+    (target - measured) along the axis; lateral centering rides on the
+    cylinder's axis passing through the origin before and after rotation.
+    """
+    axis = np.asarray(axis, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    cyl = m3d.Manifold.cylinder(a1 - a0, radius, radius, circular_segments=segments)
+    cyl = _align_z_to_axis(cyl, axis)
+    cbmin, _ = _bb(cyl)
+    target = center - axis * float(center @ axis)  # hole line, axial 0
+    target = target + axis * (a0 - float(cbmin @ axis))
+    return cyl.translate(target.tolist())
 
 # ------------------------------------------------------- hole detection
 
@@ -125,6 +216,9 @@ def detect_circular_holes(man, min_r=0.5, max_r=25.0, min_faces=6,
     normal check. Bosses/pins (outward normals) are rejected.
     """
     if _sp is None:
+        print("WARNING: scipy not installed — hole detection disabled; "
+              "resize --keep-holes, fill and round-edges hole protection "
+              "will NOT work. pip install scipy", file=sys.stderr)
         return []
     tm = man_to_tri(man)
     fa = tm.face_adjacency
@@ -225,36 +319,56 @@ def detect_circular_holes(man, min_r=0.5, max_r=25.0, min_faces=6,
 
 
 def drill_at(man, center, axis, radius, depth=None):
-    """Drill a cylindrical hole. depth=None -> through (bbox-diagonal length)."""
+    """Drill a cylindrical hole along `axis`.
+
+    depth=None -> through: spans the part's full projected extent (the axial
+        coordinate of `center` is ignored; only its lateral position matters).
+    depth=d    -> blind: `center` is the hole MOUTH on the surface; the hole
+        extends from the mouth INTO the material (along -axis) by d.
+    """
     axis = np.asarray(axis, dtype=np.float64)
     center = np.asarray(center, dtype=np.float64)
-    lo, hi = _bb(man)
-    diag = float(np.linalg.norm(hi - lo))
     if depth is None:
-        d = diag * 1.5
-        cyl = m3d.Manifold.cylinder(d, radius, radius, circular_segments=64)
-        cyl = _align_z_to_axis(cyl, axis)
-        # center the drill on the hole axis line, through everything
-        return man - cyl.translate(center)
-    d = depth
-    cyl = m3d.Manifold.cylinder(d, radius, radius, circular_segments=64)
-    cyl = _align_z_to_axis(cyl, axis)
-    start = center - axis * (d / 2)  # drill from surface point downward along axis
-    return man - cyl.translate(start)
+        lo, hi = _bb(man)
+        a0, a1 = _proj_extent(lo, hi, axis)
+        return man - _cyl_spanned(man, axis, center, radius, a0 - 1.0, a1 + 1.0)
+    if depth <= 0:
+        raise SystemExit("ERROR: --depth must be > 0")
+    c_ax = float(center @ axis)
+    return man - _cyl_spanned(man, axis, center, radius, c_ax - depth, c_ax)
 
 # ------------------------------------------------------------ the gates
 
 PRINTER_BED = {"x": 256.0, "y": 256.0, "z": 260.0}  # X2D default; override via --bed
 
+def _genus(man):
+    """Through-hole count via trimesh euler (2-2*genus); None if not decidable
+    (multi-body input or non-manifold euler)."""
+    if len(man.decompose()) != 1:
+        return None
+    e = int(man_to_tri(man).euler_number)
+    return (2 - e) // 2 if e <= 2 else None
+
 def gate_watertight(man, ctx):
     tm = man_to_tri(man)
     ok = bool(tm.is_watertight and tm.is_winding_consistent)
-    return ok, {
+    g = _genus(man) if ok else None
+    info = {
         "watertight": bool(tm.is_watertight),
         "winding_consistent": bool(tm.is_winding_consistent),
         "euler": int(tm.euler_number),
         "faces": int(len(tm.faces)),
+        "through_holes_genus": g,
     }
+    exp = ctx.get("expected_genus")
+    if exp is not None and g is not None:
+        info["expected_genus"] = exp
+        if g != exp:
+            ok = False
+            info["note"] = f"through-hole count changed: {exp} -> {g} " \
+                           "(hole preservation broken — this is how the half-depth " \
+                           "re-drill bug of 2026-09-13 would have been caught)"
+    return ok, info
 
 def gate_self_intersect(man, ctx):
     # manifold3d output is self-intersection-free by construction; tripwire only
@@ -417,21 +531,33 @@ def _fmt_axis(v):
 def op_resize(man, args):
     lo, hi = _bb(man)
     cur = hi - lo
-    if args.factor:
-        s = [args.factor] * 3 if not isinstance(args.factor, list) else args.factor
+    if args.factor is not None:
+        if args.factor <= 0:
+            raise SystemExit("ERROR: --factor must be > 0")
         factors = [float(args.factor)] * 3
     elif args.size:
         toks = args.size.lower().split("x")
-        want = [float(t) for t in toks]
+        if len(toks) != 3:
+            raise SystemExit("ERROR: --size must be three numbers WxHxD (e.g. 40x20x5)")
+        try:
+            want = [float(t) for t in toks]
+        except ValueError:
+            raise SystemExit("ERROR: --size must be three numbers WxHxD (e.g. 40x20x5)")
+        if any(w <= 0 for w in want):
+            raise SystemExit("ERROR: --size values must be > 0")
         factors = [want[i] / cur[i] for i in range(3)]
     else:
         raise SystemExit("resize needs --factor or --size")
-    scaled = man.scale(factors)
-    ctx = {"bed": _bed(args), "requested_dims": None}
-    out = scaled
+    ctx = {"bed": _bed(args),
+           "requested_dims": dict(zip("xyz", want)) if args.size
+           else {k: round(float(cur[i]) * factors[i], 3) for i, k in enumerate("xyz")}}
+    out = man.scale(factors)
     kept = []
     if args.keep_holes:
         holes = detect_circular_holes(man)  # on ORIGINAL (unscaled)
+        if not holes:
+            print("WARNING: --keep-holes set but no holes detected — "
+                  "output is a plain scale", file=sys.stderr)
         # three-step semantics: fill original -> scale -> re-drill original dia
         # (naive scale would scale holes too; re-drilling alone leaves crescents)
         filled = man
@@ -440,48 +566,67 @@ def op_resize(man, args):
             center = np.asarray(h["center"], dtype=np.float64)
             n_segs = max(4, h["wall_faces"] // 2)
             r_vertex = h["radius"] / np.cos(np.pi / n_segs)  # true vertex radius
-            length = (h["t1"] - h["t0"])   # exact flush: coplanar union, no bump
-            c = center - axis * float(center @ axis) + axis * h["t0"]  # start at hole base
-            plug = m3d.Manifold.cylinder(length, r_vertex * 1.03, r_vertex * 1.03,
-                                         circular_segments=48)
-            plug = _align_z_to_axis(plug, axis)
-            filled = filled + plug.translate(c)
-        scaled = filled.scale(factors)
-        out = scaled
-        lo2, hi2 = _bb(scaled)
-        diag = float(np.linalg.norm(hi2 - lo2))
+            # exact flush plug spanning t0..t1 (coplanar union, no bump)
+            plug = _cyl_spanned(man, axis, center, r_vertex * 1.03,
+                                h["t0"], h["t1"], segments=48)
+            filled = filled + plug
+        out = filled.scale(factors)
+        lo2, hi2 = _bb(out)
         for h in holes:
             axis = np.asarray(h["axis"], dtype=np.float64)
-            center = np.asarray(h["center"], dtype=np.float64)
+            center_s = np.asarray(h["center"], dtype=np.float64) * np.asarray(factors)
             n_segs = max(4, h["wall_faces"] // 2)
             r_vertex = h["radius"] / np.cos(np.pi / n_segs)
-            drill = m3d.Manifold.cylinder(diag * 1.5, r_vertex, r_vertex,
-                                          circular_segments=64)
-            drill = _align_z_to_axis(drill, axis)
-            out = out - drill.translate(center * np.asarray(factors))
+            a0, a1 = _proj_extent(lo2, hi2, axis)
+            out = out - _cyl_spanned(out, axis, center_s, r_vertex, a0 - 1.0, a1 + 1.0)
             kept.append({"dia": round(2 * r_vertex, 2),
-                         "new_center": (center * np.asarray(factors)).round(2).tolist()})
-    lo, hi = _bb(scaled)
-    ctx["requested_dims"] = {k: float((hi - lo)[i] * factors[i]) for i, k in enumerate("xyz")} if args.size else None
-    if args.size:
-        ctx["requested_dims"] = {}
-        for i, k in enumerate("xyz"):
-            ctx["requested_dims"][k] = float(args.size.lower().split("x")[i])
+                         "new_center": center_s.round(2).tolist()})
+    # scaling preserves topology; keep-holes is built to preserve it too
+    ctx["expected_genus"] = _genus(man)
     return out, ctx, {"factors": [round(f, 4) for f in factors], "holes_kept": kept}
 
 def op_drill(man, args):
-    at = [float(t) for t in args.at.split(",")]
-    if len(at) == 3 and args.dia and args.through:
-        holes = detect_circular_holes(man)
+    if not args.dia or args.dia <= 0:
+        raise SystemExit("ERROR: drill needs a positive --dia (e.g. --dia 4.2)")
+    if not args.at:
+        raise SystemExit("ERROR: drill needs --at x,y,z")
+    try:
+        at = [float(t) for t in args.at.split(",")]
+    except ValueError:
+        at = None
+    if not at or len(at) != 3:
+        raise SystemExit("ERROR: --at must be three numbers x,y,z (e.g. --at 30,20,4)")
+    if args.through and args.depth:
+        raise SystemExit("ERROR: use either --through or --depth, not both")
+    if not args.through and not args.depth:
+        raise SystemExit("ERROR: drill needs --through or --depth <mm>")
+    vol_before = float(man.volume())
+    if args.through:
         out = drill_at(man, at, [0, 0, 1], args.dia / 2, depth=None)
-        ctx = {"bed": _bed(args), "requested_dims": None}
-        return out, ctx, {"drilled": {"at": at, "dia": args.dia, "through": True}}
-    depth = args.depth
-    out = drill_at(man, at, [0, 0, 1], args.dia / 2, depth=depth)
-    ctx = {"bed": _bed(args), "requested_dims": None}
-    return out, ctx, {"drilled": {"at": at, "dia": args.dia, "through": False, "depth": depth}}
+        meta = {"drilled": {"at": at, "dia": args.dia, "through": True,
+                            "note": "through ignores the axial coordinate of --at"}}
+        ideal = np.pi * (args.dia / 2) ** 2 * max(1.0, 0.5 * float((_bb(man)[1] - _bb(man)[0])[2]))
+    else:
+        out = drill_at(man, at, [0, 0, 1], args.dia / 2, depth=args.depth)
+        meta = {"drilled": {"at": at, "dia": args.dia, "through": False,
+                            "depth": args.depth,
+                            "note": "--at is the hole MOUTH; the hole extends "
+                                    "into the material along -Z by --depth"}}
+        ideal = np.pi * (args.dia / 2) ** 2 * args.depth
+    removed = vol_before - float(out.volume())
+    meta["removed_mm3"] = round(removed, 2)
+    if removed < 0.5 * ideal:
+        raise SystemExit(
+            f"ERROR: drill removed only {removed:.2f}mm3 (expected ~{ideal:.1f}) — "
+            "the hole misses the material. For --depth, --at is the hole MOUTH "
+            "with material extending along -Z from it; for --through, --at must "
+            "lie inside the part in x/y.")
+    ctx = {"bed": _bed(args)}
+    return out, ctx, meta
 
 def op_fill(man, args):
+    if args.dia is not None and args.dia <= 0:
+        raise SystemExit("ERROR: --dia must be > 0")
     holes = detect_circular_holes(man)
     if args.dia:
         targets = [h for h in holes if h["dia"] <= args.dia + 0.15]
@@ -489,33 +634,47 @@ def op_fill(man, args):
         targets = list(holes)
     if not targets:
         raise SystemExit("no holes to fill (try --dia to include larger, or check info)")
+    lo, hi = _bb(man)
     out = man
+    n_through = 0
     for h in targets:
         axis = np.asarray(h["axis"], dtype=np.float64)
         center = np.asarray(h["center"], dtype=np.float64)
-        # axial extent of the hole wall — fill EXACTLY that span (no bump)
-        length = h["t1"] - h["t0"]
-        # center of the fill span: project center, use midpoint of t0,t1
-        c = center - axis * (float(np.asarray(center) @ axis)) + axis * h["t0"]  # start at hole base
-        cyl = m3d.Manifold.cylinder(length, h["radius"], h["radius"], circular_segments=64)
-        cyl = _align_z_to_axis(cyl, axis)
-        out = out + cyl.translate(c)
-    ctx = {"bed": _bed(args), "requested_dims": None}
-    return out, ctx, {"filled": [{"dia": h["dia"], "center": h["center"]} for h in targets]}
+        # fill EXACTLY the hole-wall span (no bump); count through-holes for genus.
+        # Plug radius gets the documented +3% coefficient: at exactly the fitted
+        # radius the plug wall is coincident with the hole wall, and coplanar
+        # contact does not guarantee welding (SKILL.md) — on manifold3d v3 this
+        # left 128 microscopic handles (genus 128) instead of a clean fill.
+        a0, a1 = _proj_extent(lo, hi, axis)
+        if h["t0"] <= a0 + 0.05 and h["t1"] >= a1 - 0.05:
+            n_through += 1
+        out = out + _cyl_spanned(man, axis, center, h["radius"] * 1.03,
+                                 h["t0"], h["t1"], segments=48)
+    ctx = {"bed": _bed(args)}
+    g = _genus(man)
+    if g is not None:
+        ctx["expected_genus"] = max(0, g - n_through)
+    return out, ctx, {"filled": [{"dia": h["dia"], "center": h["center"],
+                                  "through": h["t0"] <= a0 + 0.05 and h["t1"] >= a1 - 0.05}
+                                 for h in targets]}
 
 def op_thicken(man, args):
+    if not args.by or args.by <= 0:
+        raise SystemExit("ERROR: thicken needs --by > 0")
     r = float(args.by)
     sph = m3d.Manifold.sphere(r, circular_segments=48)
     out = man.minkowski_sum(sph)
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     return out, ctx, {"thickened_by_mm": r}
 
 def op_hollow(man, args):
+    if not args.wall or args.wall <= 0:
+        raise SystemExit("ERROR: hollow needs --wall > 0")
     w = float(args.wall)
     sph = m3d.Manifold.sphere(w, circular_segments=48)
     eroded = man.minkowski_difference(sph)
     out = man - eroded
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     meta = {"wall_mm": w}
     if args.open_bottom:
         lo, hi = _bb(man)
@@ -527,6 +686,8 @@ def op_hollow(man, args):
     return out, ctx, meta
 
 def op_round_edges(man, args):
+    if not args.radius or args.radius <= 0:
+        raise SystemExit("ERROR: round-edges needs --radius > 0")
     r = float(args.radius)
     sph = m3d.Manifold.sphere(r, circular_segments=48)
     holes = detect_circular_holes(man)
@@ -536,34 +697,39 @@ def op_round_edges(man, args):
         center = np.asarray(h["center"], dtype=np.float64)
         n_segs = max(4, h["wall_faces"] // 2)
         r_vertex = h["radius"] / np.cos(np.pi / n_segs)
-        length = (h["t1"] - h["t0"])
-        c = center - axis * float(center @ axis) + axis * h["t0"]
-        plug = m3d.Manifold.cylinder(length, r_vertex * 1.03, r_vertex * 1.03,
-                                      circular_segments=48)
-        plug = _align_z_to_axis(plug, axis)
-        filled = filled + plug.translate(c)
+        plug = _cyl_spanned(man, axis, center, r_vertex * 1.03,
+                            h["t0"], h["t1"], segments=48)
+        filled = filled + plug
     out = filled.minkowski_sum(sph).minkowski_difference(sph)
     lo, hi = _bb(out)
-    diag = float(np.linalg.norm(hi - lo))
     for h in holes:  # re-drill at original dia after rounding
         axis = np.asarray(h["axis"], dtype=np.float64)
         center = np.asarray(h["center"], dtype=np.float64)
         n_segs = max(4, h["wall_faces"] // 2)
         r_vertex = h["radius"] / np.cos(np.pi / n_segs)
-        drill = m3d.Manifold.cylinder(diag * 1.5, r_vertex, r_vertex,
-                                      circular_segments=64)
-        drill = _align_z_to_axis(drill, axis)
-        out = out - drill.translate(center)
-    ctx = {"bed": _bed(args), "requested_dims": None}
+        a0, a1 = _proj_extent(lo, hi, axis)
+        out = out - _cyl_spanned(out, axis, center, r_vertex, a0 - 1.0, a1 + 1.0)
+    ctx = {"bed": _bed(args), "expected_genus": _genus(man)}
     return out, ctx, {"rounded_radius_mm": r,
                       "holes_protected": len(holes)}
 
 def op_cut(man, args):
     # --at z=10 --keep top|bottom
+    if not args.at or args.at.count("=") != 1:
+        raise SystemExit("ERROR: cut needs --at axis=value (e.g. --at z=10)")
     spec = args.at.lower().replace(" ", "")
     axis_name, val = spec.split("=")
+    if axis_name not in ("x", "y", "z"):
+        raise SystemExit("ERROR: --at axis must be x, y or z (e.g. --at z=10)")
+    try:
+        val = float(val)
+    except ValueError:
+        raise SystemExit("ERROR: --at value must be a number (e.g. --at z=10)")
     idx = "xyz".index(axis_name)
     lo, hi = _bb(man)
+    if not (lo[idx] < val < hi[idx]):
+        raise SystemExit(f"ERROR: cut plane {axis_name}={val} is outside the part "
+                         f"({axis_name} spans {lo[idx]:.1f}..{hi[idx]:.1f}) — nothing to cut")
     keep_top = args.keep == "top"
     n = np.zeros(3); n[idx] = 1
     if keep_top:
@@ -571,15 +737,18 @@ def op_cut(man, args):
         out = man.trim_by_plane(n.tolist(), float(val))
     else:
         out = man.trim_by_plane((-n).tolist(), -float(val))
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     return out, ctx, {"cut": spec, "kept": args.keep}
 
 def op_extend(man, args):
+    if not args.axis:
+        raise SystemExit("ERROR: extend needs --axis x|y|z")
+    if not args.by or args.by <= 0:
+        raise SystemExit("ERROR: extend needs --by > 0")
     idx = "xyz".index(args.axis.lower())
     by = float(args.by)
     lo, hi = _bb(man)
     top = hi[idx]
-    n = np.zeros(3); n[idx] = 1
     # slice at the growing face, extrude slab, translate & union
     eps = min(0.02, by * 0.01)
     t = top - eps
@@ -591,16 +760,27 @@ def op_extend(man, args):
         size = h2 - l2
         slab = m3d.Manifold.cube(size.tolist()).translate(l2.tolist())
         out = man + slab
+        note = ("xy extend uses a full-bbox slab — on non-rectangular "
+                "cross-sections this adds a rectangular skirt; z extends "
+                "the silhouette")
     else:
         slab = m3d.Manifold.extrude(cs, by)
         out = man + slab.translate([0, 0, top])
-    ctx = {"bed": _bed(args), "requested_dims": None}
-    return out, ctx, {"extended": {"axis": args.axis, "by_mm": by}}
+        note = "z extend extrudes the silhouette at the growing face (through-holes continue)"
+    ctx = {"bed": _bed(args)}
+    return out, ctx, {"extended": {"axis": args.axis, "by_mm": by}, "note": note}
 
 def op_shrink(man, args):
+    if not args.axis:
+        raise SystemExit("ERROR: shrink needs --axis x|y|z")
+    if not args.by or args.by <= 0:
+        raise SystemExit("ERROR: shrink needs --by > 0")
     idx = "xyz".index(args.axis.lower())
     by = float(args.by)
     lo, hi = _bb(man)
+    if by >= hi[idx] - lo[idx]:
+        raise SystemExit(f"ERROR: --by {by} >= part {args.axis}-size "
+                         f"{hi[idx] - lo[idx]:.1f} — nothing would remain")
     n = np.zeros(3); n[idx] = 1
     cut_from = hi[idx] - by
     # subtract slab above cut line
@@ -609,17 +789,21 @@ def op_shrink(man, args):
     size = h2 - l2
     slab = m3d.Manifold.cube(size.tolist()).translate(l2.tolist())
     out = man - slab
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     return out, ctx, {"shrunk": {"axis": args.axis, "by_mm": by}}
 
 def op_mirror(man, args):
+    if not args.axis:
+        raise SystemExit("ERROR: mirror needs --axis x|y|z")
     idx = "xyz".index(args.axis.lower())
     n = np.zeros(3); n[idx] = 1.0
     out = man.mirror(n.tolist())
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     return out, ctx, {"mirrored": args.axis}
 
 def op_relocate(man, args):
+    if not args.to and not args.drop_to_bed:
+        raise SystemExit("ERROR: relocate needs --to origin and/or --drop-to-bed")
     out = man
     lo, hi = _bb(man)
     if args.to == "origin":
@@ -627,7 +811,7 @@ def op_relocate(man, args):
     if args.drop_to_bed:
         lo2, hi2 = _bb(out)
         out = out.translate([0, 0, -lo2[2]])
-    ctx = {"bed": _bed(args), "requested_dims": None}
+    ctx = {"bed": _bed(args)}
     return out, ctx, {"moved_from": lo.round(2).tolist()}
 
 # ---------------------------------------------------------------- CLI
@@ -653,7 +837,8 @@ def build_parser():
     p.add_argument("--through", action="store_true")
     p.add_argument("--depth", type=float)
     # fill
-    p.add_argument("--dia-max", type=float, help="(fill) max dia to fill, alias of --dia")
+    p.add_argument("--dia-max", type=float, dest="dia",
+                   help="(fill) max dia to fill — alias of --dia")
     # thicken/hollow/round
     p.add_argument("--by", type=float)
     p.add_argument("--wall", type=float)
@@ -671,7 +856,6 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
     man = load_manifold(args.input)
-    ctx0 = {"bed": _bed(args)}
     if args.op == "info":
         return op_info(man, args)
     if args.op == "gates":
@@ -682,21 +866,24 @@ def main():
         "cut": op_cut, "extend": op_extend, "shrink": op_shrink,
         "mirror": op_mirror, "relocate": op_relocate,
     }
+    n_bodies_in = len(man.decompose())
     out, ctx, meta = ops[args.op](man, args)
     if not args.output:
         base, ext = os.path.splitext(args.input)
         args.output = f"{base}.{args.op}{ext or '.stl'}"
     export(out, args.output)
+    exp_ok, exp_report = verify_export(out, args.output, n_bodies_in)
     ok, gates = run_gates(out, ctx)
     report = {
         "op": args.op,
         "output": args.output,
-        "pass": ok,
+        "pass": ok and exp_ok,
         "meta": meta,
         "gates": gates,
+        "export_check": exp_report,
     }
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    sys.exit(0 if ok else 2)
+    sys.exit(0 if (ok and exp_ok) else 2)
 
 if __name__ == "__main__":
     main()

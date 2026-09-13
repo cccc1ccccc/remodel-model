@@ -47,7 +47,10 @@ def main():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.font_manager as fm
-    for f in ("/mnt/c/Windows/Fonts/msyh.ttc", "/mnt/c/Windows/Fonts/simhei.ttf"):
+    # WSL (/mnt/c), native Windows (C:\), macOS (PingFang) font locations
+    for f in ("/mnt/c/Windows/Fonts/msyh.ttc", "/mnt/c/Windows/Fonts/simhei.ttf",
+              r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf",
+              "/System/Library/Fonts/PingFang.ttc"):
         try:
             fm.fontManager.addfont(f)
             import matplotlib.pyplot as plt
